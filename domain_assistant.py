@@ -21,7 +21,13 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from dotenv import load_dotenv
-from openai import OpenAI, OpenAIError
+from openai import (
+    APIConnectionError,
+    InternalServerError,
+    OpenAI,
+    OpenAIError,
+    RateLimitError,
+)
 
 load_dotenv(Path(__file__).resolve().with_name(".env"))
 
@@ -266,6 +272,82 @@ class OpenAIGenerator:
         return answer
 
 
+GEMINI_OPENAI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
+
+
+class GeminiGenerator:
+    """Gemini via Google's OpenAI-compatible endpoint (no extra dependency).
+
+    Same prompt, temperature and output budget as OpenAIGenerator so only the
+    model changes between runs.
+    """
+
+    def __init__(self, max_output_tokens: int = 300) -> None:
+        api_key = os.getenv("GEMINI_API_KEY", "").strip()
+        self.model = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip()
+        if not api_key:
+            raise RuntimeError("GEMINI_API_KEY is missing from .env")
+        if not self.model:
+            raise RuntimeError("GEMINI_MODEL is missing from .env")
+        # max_retries=0: the SDK's own silent retries would each consume the
+        # free-tier daily quota; retries are handled explicitly in generate().
+        self.client = OpenAI(
+            api_key=api_key, base_url=GEMINI_OPENAI_BASE_URL, max_retries=0
+        )
+        self.max_output_tokens = max_output_tokens
+        # Free tier: 5 requests/minute per model -> space calls ~13s apart so a
+        # full run does not trip the per-minute limit.
+        self.min_interval = float(os.getenv("GEMINI_MIN_INTERVAL", "13"))
+        self._last_call = 0.0
+
+    def generate(self, prompt: str, max_retries: int = 5) -> str:
+        for attempt in range(max_retries + 1):
+            wait = self.min_interval - (time.monotonic() - self._last_call)
+            if wait > 0:
+                time.sleep(wait)
+            self._last_call = time.monotonic()
+            try:
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0,
+                    max_tokens=self.max_output_tokens,
+                    # Disable Gemini "thinking" so hidden reasoning does not consume
+                    # the 300-token output budget and truncate the visible answer.
+                    reasoning_effort="none",
+                )
+                break
+            except (RateLimitError, InternalServerError, APIConnectionError) as exc:
+                # 429: free tier allows only a few requests per minute -> wait for
+                # the delay Google suggests. 5xx (e.g. 503 "high demand") is
+                # transient -> back off and retry the same prompt.
+                if attempt == max_retries:
+                    raise
+                match = re.search(r"retry in ([\d.]+)s", str(exc))
+                if match:
+                    delay = float(match.group(1)) + 1
+                elif isinstance(exc, RateLimitError):
+                    delay = 60.0
+                else:
+                    delay = 15.0 * (attempt + 1)
+                print(f"  {getattr(exc, 'status_code', 'timeout')}; waiting {delay:.0f}s before retry", flush=True)
+                time.sleep(delay)
+        answer = (response.choices[0].message.content or "").strip()
+        if not answer:
+            raise RuntimeError("Gemini returned an empty answer")
+        return answer
+
+
+def default_generator() -> TextGenerator:
+    """Pick the generator from LLM_PROVIDER in .env (default: openai)."""
+    provider = os.getenv("LLM_PROVIDER", "openai").strip().lower()
+    if provider == "gemini":
+        return GeminiGenerator()
+    if provider == "openai":
+        return OpenAIGenerator()
+    raise RuntimeError(f"Unsupported LLM_PROVIDER {provider!r}; use 'openai' or 'gemini'")
+
+
 @dataclass(frozen=True)
 class DomainResponse:
     question: str
@@ -299,7 +381,7 @@ class DomainAssistant:
         return cls(
             corpus_id,
             BM25Retriever(chunks),
-            generator if generator is not None else OpenAIGenerator(),
+            generator if generator is not None else default_generator(),
             top_k,
         )
 
@@ -380,8 +462,15 @@ def generate_actual_answers(
     generator: TextGenerator | None = None,
     top_k: int = 5,
     progress: ProgressCallback | None = None,
+    checkpoint_path: str | Path | None = None,
 ) -> dict[str, Any]:
-    """Generate the auditable actual-answer artifact for all dataset questions."""
+    """Generate the auditable actual-answer artifact for all dataset questions.
+
+    When ``checkpoint_path`` is given, each generated answer is saved there
+    immediately, and a rerun reuses saved answers only if they were produced by
+    the same model/top_k for the same question. This lets a run interrupted by
+    API quota limits resume without regenerating (or hand-filling) answers.
+    """
 
     def notify(message: str) -> None:
         if progress is not None:
@@ -405,8 +494,36 @@ def generate_actual_answers(
         f"model={model}, top_k={top_k}"
     )
 
+    checkpoint_file = Path(checkpoint_path).expanduser().resolve() if checkpoint_path else None
+    saved: dict[str, dict[str, Any]] = {}
+    if checkpoint_file is not None and checkpoint_file.is_file():
+        state = json.loads(checkpoint_file.read_text(encoding="utf-8"))
+        if state.get("model") == model and state.get("top_k") == top_k:
+            saved = {a["id"]: a for a in state.get("answers", [])}
+        else:
+            notify("Checkpoint is from a different model/top_k; ignoring it.")
+
+    def save_checkpoint() -> None:
+        if checkpoint_file is None:
+            return
+        checkpoint_file.parent.mkdir(parents=True, exist_ok=True)
+        checkpoint_file.write_text(
+            json.dumps(
+                {"model": model, "top_k": top_k, "answers": list(saved.values())},
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
     answers: list[dict[str, Any]] = []
     for index, item in enumerate(questions, start=1):
+        previous = saved.get(item["id"])
+        if previous is not None and previous.get("question") == item["question"]:
+            answers.append(previous)
+            notify(f"{item['id']} reused from checkpoint")
+            continue
+
         percentage = index / total
         completed_before = index - 1
         filled_before = round(20 * completed_before / total)
@@ -426,8 +543,7 @@ def generate_actual_answers(
             notify(f"FAILED at {item['id']}; stopping the run.")
             raise
 
-        answers.append(
-            {
+        record = {
                 "id": item["id"],
                 "question": item["question"],
                 "actual_answer": response.actual_answer,
@@ -442,7 +558,9 @@ def generate_actual_answers(
                 ],
                 "error": None,
             }
-        )
+        answers.append(record)
+        saved[item["id"]] = record
+        save_checkpoint()
 
         filled_after = round(20 * percentage)
         bar_after = "#" * filled_after + "-" * (20 - filled_after)
@@ -500,6 +618,7 @@ def main() -> int:
             args.corpus_dir,
             top_k=args.top_k,
             progress=lambda message: print(message, flush=True),
+            checkpoint_path=args.output.with_name(args.output.stem + ".partial.json"),
         )
         output = args.output.expanduser().resolve()
         output.parent.mkdir(parents=True, exist_ok=True)
